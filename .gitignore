@@ -23,3 +23,6 @@ output/
 *.wmv
 *.webm
 *.srt
+
+# ProPainter checkout (see README)
+ProPainter/

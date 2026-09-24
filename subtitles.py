@@ -1,0 +1,166 @@
+"""Subtitle recognition: OCR, subtitle-line detection, segmentation into sentences, SRT output."""
+import difflib
+from collections import Counter
+from dataclasses import dataclass, field
+
+import numpy as np
+
+
+class OCR:
+    def __init__(self, device):
+        from rapidocr import RapidOCR
+        params = {"Det.limit_type": "max", "Det.limit_side_len": 960,
+                  "Global.log_level": "error"}
+        if device == "cuda":
+            params["EngineConfig.onnxruntime.use_cuda"] = True
+        elif device == "dml":
+            params["EngineConfig.onnxruntime.use_dml"] = True
+        self.engine = RapidOCR(params=params)
+
+    def __call__(self, img):
+        r = self.engine(img, use_cls=False)
+        if r.boxes is None or r.txts is None:
+            return []
+        return [(np.asarray(b), t, float(s)) for b, t, s in zip(r.boxes, r.txts, r.scores)]
+
+
+@dataclass
+class Seg:
+    """One subtitle: frame range, text votes and all its text boxes."""
+    start: int
+    end: int
+    texts: Counter = field(default_factory=Counter)
+    boxes: list = field(default_factory=list)  # (x0, y0, x1, y1) in full-frame coordinates
+
+    @property
+    def text(self):
+        return self.texts.most_common(1)[0][0]
+
+    @property
+    def xr(self):
+        return min(b[0] for b in self.boxes), max(b[2] for b in self.boxes)
+
+
+def frame_boxes(items, band_y0, W, min_h, min_score):
+    """First-pass filter of one frame's OCR results -> [(x0, y0, x1, y1, text)] in full-frame coordinates"""
+    keep = []
+    for box, txt, score in items:
+        x0, y0 = box.min(0)
+        x1, y1 = box.max(0)
+        cx = (x0 + x1) / 2
+        if score < min_score or (y1 - y0) < min_h or not txt.strip():
+            continue
+        if not (0.15 * W < cx < 0.85 * W):  # subtitles are normally centred
+            continue
+        keep.append((int(x0), int(y0) + band_y0, int(x1), int(y1) + band_y0, txt.strip()))
+    return keep
+
+
+def subtitle_line(per_frame):
+    """Find where subtitles usually sit from all text boxes in the video: (bottom line y-centre, text height)"""
+    ys = [((b[1] + b[3]) / 2, b[3] - b[1]) for boxes in per_frame for b in boxes]
+    if not ys:
+        return None
+    yc = np.array([y for y, _ in ys])
+    hs = np.array([h for _, h in ys])
+    hist = np.bincount((yc // 4).astype(int))
+    mode = (np.argmax(hist) + 0.5) * 4
+    h = float(np.median(hs[np.abs(yc - mode) < 8]))
+    return mode, h
+
+
+def filter_line(boxes, line):
+    """Keep only boxes matching the subtitle line position and height (one extra line above is allowed for two-line subtitles)"""
+    if line is None:
+        return boxes
+    mode, h = line
+    keep = [b for b in boxes
+            if 0.75 * h <= b[3] - b[1] <= 1.33 * h
+            and mode - 2.5 * h <= (b[1] + b[3]) / 2 <= mode + 0.5 * h]
+    main = [b for b in keep if abs((b[1] + b[3]) / 2 - mode) <= 0.5 * h]
+    if not main:
+        return []
+    # An upper line must lie entirely above the subtitle line (boxes overlapping it vertically are scene texture/objects)
+    top = min(b[1] for b in main)
+    return main + [b for b in keep if b not in main and b[3] <= top + 0.1 * h]
+
+
+def join_text(keep):
+    """Sort into lines and join -> (text, [boxes])"""
+    if not keep:
+        return None, []
+    # Group boxes whose y-centres are close into the same line
+    keep.sort(key=lambda b: (b[1] + b[3]) / 2)
+    lines, cur = [], [keep[0]]
+    for b in keep[1:]:
+        ph = cur[-1][3] - cur[-1][1]
+        if abs((b[1] + b[3]) / 2 - (cur[-1][1] + cur[-1][3]) / 2) < 0.5 * ph:
+            cur.append(b)
+        else:
+            lines.append(cur)
+            cur = [b]
+    lines.append(cur)
+    text = "\n".join(" ".join(b[4] for b in sorted(l, key=lambda b: b[0])) for l in lines)
+    return text, [b[:4] for b in keep]
+
+
+def similar(a, b):
+    return difflib.SequenceMatcher(None, a.replace(" ", ""), b.replace(" ", "")).ratio()
+
+
+def _x_overlap(a, b):
+    (ax0, ax1), (bx0, bx1) = a.xr, b.xr
+    return min(ax1, bx1) - max(ax0, bx0) > 0.4 * min(ax1 - ax0, bx1 - bx0)
+
+
+def build_segments(per_frame, max_gap, min_len):
+    """per_frame: [(text, boxes)] -> [Seg]"""
+    # 1) Consecutive frames with identical text (ignoring spaces) -> runs
+    runs = []
+    for i, (text, boxes) in enumerate(per_frame):
+        if not text:
+            continue
+        r = runs[-1] if runs else None
+        if r and i - r.end <= max_gap + 1 and r.text.replace(" ", "") == text.replace(" ", ""):
+            r.end = i
+            r.texts[text] += 1
+            r.boxes += boxes
+        else:
+            runs.append(Seg(i, i, Counter({text: 1}), list(boxes)))
+    # 2) Merge OCR jitter: very similar text, or a short run fairly similar to the previous one.
+    #    Two long runs with different text are kept as two separate subtitles.
+    short = max(min_len, 4)
+    segs = []
+    for r in runs:
+        p = segs[-1] if segs else None
+        if p and r.start - p.end <= max_gap + 1 and _x_overlap(p, r):
+            s = similar(p.text, r.text)
+            rl, pl = r.end - r.start + 1, p.end - p.start + 1
+            if s >= 0.9 or (s >= 0.6 and min(rl, pl) < short):
+                p.end = r.end
+                p.texts.update(r.texts)
+                p.boxes += r.boxes
+                continue
+        segs.append(r)
+    return [s for s in segs if s.end - s.start + 1 >= min_len]
+
+
+def segments_from_ocr(per_frame, fps, max_gap=5, min_dur=0.4):
+    """Raw per-frame OCR boxes -> (subtitle line, [Seg])"""
+    line = subtitle_line(per_frame)
+    texts = [join_text(filter_line(list(b), line)) for b in per_frame]
+    return line, build_segments(texts, max_gap=max_gap, min_len=max(2, round(min_dur * fps)))
+
+
+def ts(sec):
+    ms = int(round(sec * 1000))
+    h, ms = divmod(ms, 3600000)
+    m, ms = divmod(ms, 60000)
+    s, ms = divmod(ms, 1000)
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def write_srt(segs, fps, path):
+    with open(path, "w", encoding="utf-8") as f:
+        for k, s in enumerate(segs, 1):
+            f.write(f"{k}\n{ts(s.start / fps)} --> {ts((s.end + 1) / fps)}\n{s.text}\n\n")

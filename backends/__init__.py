@@ -1,0 +1,23 @@
+"""Inpainting backends.
+
+A backend erases subtitles from a sequential frame stream:
+
+    backend.erase(frames, frame_seg, masks) -> iterator of frames
+
+- frames:    iterator of HxWx3 BGR uint8 frames, in order, starting at frame 0
+- frame_seg: {frame index: segment index} for every frame that needs erasing
+- masks:     {segment index: HxW bool mask}
+It must yield exactly one output frame per input frame, in the same order.
+"""
+
+MODELS = ("lama", "propainter")
+
+
+def create(model, providers=None, propainter_dir=None, chunk=120, raft_iter=20):
+    if model == "lama":
+        from .lama import LamaBackend
+        return LamaBackend(providers)
+    if model == "propainter":
+        from .propainter import ProPainterBackend
+        return ProPainterBackend(propainter_dir, chunk=chunk, raft_iter=raft_iter)
+    raise ValueError(f"unknown model: {model}")

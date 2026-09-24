@@ -17,7 +17,7 @@ Removes hardcoded (burned-in) subtitles from videos and extracts them as SRT. Po
 | OS | Windows 10/11 or Linux (tested on Ubuntu 22.04) |
 | Python | 3.10 – 3.13 |
 | GPU | NVIDIA with 4 GB+ VRAM; driver with CUDA 12 support (RTX 50 series needs a CUDA 12.8+ driver) |
-| ffmpeg | `ffmpeg` and `ffprobe`, either on PATH or in an `ffmpeg/` folder next to `cleanframe.py` |
+| ffmpeg | `ffmpeg` and `ffprobe`, either on PATH or in an `ffmpeg/` folder in the repository root |
 
 Getting ffmpeg:
 - **Windows**: download a release build from https://www.gyan.dev/ffmpeg/builds/ and copy `ffmpeg.exe` and `ffprobe.exe` from `bin` into `ffmpeg\`
@@ -79,6 +79,7 @@ For each video the output directory contains:
 | Option | Default | Description |
 |---|---|---|
 | `-o, --out` | `output` | output directory |
+| `-m, --model` | `lama` | inpainting model: `lama` (fast, default) or `propainter` (video model, slower; see below) |
 | `--srt-only` | | extract subtitles only, do not erase |
 | `--band` | `0.70,1.0` | horizontal band containing subtitles, as fractions or pixels. The default is the bottom 30% of the frame; use `0,0.3` for subtitles at the top |
 | `--device` | `auto` | `auto` / `cuda` / `cpu` / `dml` (`dml` requires onnxruntime-directml) |
@@ -99,7 +100,6 @@ For each video the output directory contains:
 | `--max-gap` | `5` | missed frames tolerated within one subtitle |
 | `--min-score` | `0.6` | OCR confidence threshold |
 | `--min-height` | `0.015` | minimum text height as a fraction of frame height |
-| `--temporal` | `0` | experimental: borrow real background pixels from nearby frames; off by default |
 
 ## How it works
 
@@ -107,7 +107,11 @@ For each video the output directory contains:
 2. **Region detection**: text boxes from the whole video are analysed to find the usual line position and text height; text that does not match is discarded
 3. **Sentence segmentation**: consecutive frames with the same or similar text are merged into one subtitle with start/end times and written to SRT
 4. **Masks**: for each subtitle, pixels that are white in more than half of its frames are treated as strokes, then dilated to cover the outline and shadow. The mask is fixed within a subtitle, so there is no flicker
-5. **Erasing**: the subtitle line is cut into strips and packed into one 512×512 image so LaMa inpaints the whole line in a single call. Only pixels inside the mask are replaced
+5. **Erasing**:
+   - `lama`: the subtitle line is cut into strips and packed into one 512×512 image so LaMa inpaints the whole line in a single call
+   - `propainter`: frames are streamed in chunks; only the frame ranges with subtitles and only the subtitle band are inpainted using neighbouring frames
+
+   In both cases only pixels inside the mask are replaced
 6. **Encoding**: ffmpeg encodes the video and copies the original audio
 
 ## Performance
@@ -119,31 +123,59 @@ Test clip: 1920×1080, 25 fps, 5 minutes, ~100 subtitles.
 | NVIDIA A10 | 154 s | 363 s | ~8.6 min |
 | RTX 3050 (estimated) | | | ~20–25 min |
 
-## ProPainter high-quality mode (experimental, optional)
+## ProPainter model (optional)
 
-`propainter/` contains an erase pipeline based on the [ProPainter](https://github.com/sczhou/ProPainter) video inpainting model. It uses information from neighbouring frames and handles moving people or cameras better, but it is **much slower**: the test clip takes about 45 minutes on an A10 and needs about 13 GB of VRAM.
+`--model propainter` uses the [ProPainter](https://github.com/sczhou/ProPainter) video inpainting model. It fills the masked area with information from neighbouring frames and handles moving people or cameras better than LaMa, but it is **much slower** (the test clip takes about 30–45 minutes on an A10) and needs PyTorch.
 
-> ⚠️ **ProPainter is licensed under the NTU S-Lab License 1.0, non-commercial use only.** Do not use this mode in commercial projects.
+> ⚠️ **ProPainter is licensed under the NTU S-Lab License 1.0, non-commercial use only.** Do not use this model in commercial projects.
 
-Steps:
+Setup (in the same `.venv`):
 
 ```bash
-# 1. Set up a separate PyTorch environment with the ProPainter code and weights
+# 1. PyTorch matching your CUDA version: https://pytorch.org/get-started/locally/
+.venv/bin/python -m pip install -r requirements-propainter.txt
+
+# 2. ProPainter code, cloned into ./ProPainter (or anywhere, see --propainter-dir)
 git clone https://github.com/sczhou/ProPainter.git
-pip install torch torchvision opencv-python numpy -r ProPainter/requirements.txt
-# Put the three weight files into ProPainter/weights/:
+.venv/bin/python -m pip install -r ProPainter/requirements.txt
+
+# 3. Weights into ProPainter/weights/
 #   https://github.com/sczhou/ProPainter/releases/download/v0.1.0/ProPainter.pth
 #   https://github.com/sczhou/ProPainter/releases/download/v0.1.0/recurrent_flow_completion.pth
 #   https://github.com/sczhou/ProPainter/releases/download/v0.1.0/raft-things.pth
-
-# 2. Create the OCR cache with the main program
-python cleanframe.py video.mp4 -o output --srt-only
-
-# 3. Run the ProPainter erase (inside the PyTorch environment)
-python propainter/pp_full.py video.mp4 -o output --propainter /path/to/ProPainter
 ```
 
-The result is written to `output/name_clean_pp.mp4`. On 8 GB GPUs add `--chunk 80`.
+Run:
+
+```bash
+run.bat D:\videos -o D:\output -m propainter
+./run.sh /data/videos -o /data/output -m propainter --propainter-dir /opt/ProPainter
+```
+
+| Option | Default | Description |
+|---|---|---|
+| `--propainter-dir` | `$PROPAINTER_DIR` or `./ProPainter` | ProPainter checkout containing `weights/` |
+| `--pp-chunk` | `120` | frames per chunk. GPU memory grows with it: ~13 GB at 120 frames for a 1080p subtitle band. Use `80` or lower on 8 GB cards |
+| `--pp-raft-iter` | `20` | optical flow iterations; fewer is faster but less accurate |
+
+The OCR cache is shared between models, so you can switch between `lama` and `propainter` on the same output directory without running OCR again.
+
+## Project layout
+
+```
+main.py            entry point
+cli.py             command-line options, batch loop
+pipeline.py        per-video flow: OCR -> SRT -> masks -> erase -> encode
+subtitles.py       OCR, subtitle-line detection, segmentation, SRT
+masks.py           glyph / box masks
+video.py           ffmpeg decoding and encoding
+device.py          ONNX Runtime device selection
+common.py          shared constants and helpers
+backends/lama.py        LaMa backend (ONNX Runtime)
+backends/propainter.py  ProPainter backend (PyTorch)
+```
+
+Both backends implement `erase(frames, frame_seg, masks)`, which takes the frame stream plus one mask per subtitle and yields the erased frames in order.
 
 ## Troubleshooting
 
