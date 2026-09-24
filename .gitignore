@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# Models and third-party binaries (see README for download links)
+models/
+*.onnx
+*.pth
+ffmpeg/
+
+# Media and outputs
+videos/
+output/
+交付预览/
+*.mp4
+*.mkv
+*.mov
+*.avi
+*.flv
+*.ts
+*.m4v
+*.wmv
+*.webm
+*.srt
