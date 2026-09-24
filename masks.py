@@ -67,10 +67,19 @@ def glyph_masks(src, W, H, band, segs, dilate, grow, shift):
     return out
 
 
-def frame_to_segment(segs, pad):
-    """{frame index: segment index}, including `pad` extra frames before/after each segment"""
-    frame_seg = {}
+def frame_masks(segs, masks, pad):
+    """Map every frame to be erased onto a mask, including `pad` extra frames before/after each segment.
+
+    A frame covered by several segments (back-to-back subtitles, where one segment's padding
+    overlaps the next segment) gets the union of their masks - otherwise the new subtitle would be
+    left unmasked on that frame, and ProPainter would even propagate it into neighbouring frames.
+    Returns ({frame index: mask key}, {mask key: HxW bool mask}); a key is a tuple of segment indices."""
+    cover = {}
     for k, s in enumerate(segs):
         for i in range(max(0, s.start - pad), s.end + pad + 1):
-            frame_seg.setdefault(i, k)
-    return frame_seg
+            cover.setdefault(i, []).append(k)
+    frame_key = {i: tuple(ks) for i, ks in cover.items()}
+    out = {}
+    for key in set(frame_key.values()):
+        out[key] = masks[key[0]] if len(key) == 1 else np.logical_or.reduce([masks[k] for k in key])
+    return frame_key, out

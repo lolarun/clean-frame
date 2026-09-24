@@ -6,7 +6,7 @@ from pathlib import Path
 import numpy as np
 
 from common import log
-from masks import box_masks, frame_to_segment, glyph_masks, white_pixels
+from masks import box_masks, frame_masks, glyph_masks, white_pixels
 from subtitles import frame_boxes, segments_from_ocr, write_srt
 from video import open_writer, probe, read_frames
 
@@ -79,7 +79,7 @@ def process(src, out_dir, args, ocr, backend, encoder):
         masks = glyph_masks(src, W, H, band, segs, args.dilate, args.grow, args.shadow)
     else:
         masks = box_masks(segs, H, W, args.dilate)
-    frame_seg = frame_to_segment(segs, args.pad_frames)
+    frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
     log(f"  {args.mask} masks done ({time.time() - t0:.0f}s)")
 
     # Pass 2: erase + encode

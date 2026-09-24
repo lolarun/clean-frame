@@ -5,8 +5,8 @@ A backend erases subtitles from a sequential frame stream:
     backend.erase(frames, frame_seg, masks) -> iterator of frames
 
 - frames:    iterator of HxWx3 BGR uint8 frames, in order, starting at frame 0
-- frame_seg: {frame index: segment index} for every frame that needs erasing
-- masks:     {segment index: HxW bool mask}
+- frame_seg: {frame index: mask key} for every frame that needs erasing
+- masks:     {mask key: HxW bool mask}
 It must yield exactly one output frame per input frame, in the same order.
 """
 
