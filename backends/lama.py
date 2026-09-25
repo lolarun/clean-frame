@@ -159,7 +159,7 @@ class LamaBackend:
     def __init__(self, providers):
         self.lama = Lama(providers)
 
-    def erase(self, frames, frame_seg, masks):
+    def erase(self, frames, frame_seg, masks, cuts=()):
         for i, frame in enumerate(frames):
             k = frame_seg.get(i)
             yield inpaint_packed(frame, masks[k], self.lama) if k is not None else frame

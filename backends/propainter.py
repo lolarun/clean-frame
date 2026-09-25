@@ -8,6 +8,7 @@ Only the frames that contain subtitles (plus context) and only the horizontal ba
 subtitles appear are inpainted; the result is composited back into the original frames.
 Frames are streamed: at most about one chunk of full frames is held in memory.
 """
+import bisect
 import sys
 from collections import deque
 from pathlib import Path
@@ -74,6 +75,8 @@ class ProPainterEngine:
     def __call__(self, frames, masks, dilation=2):
         """frames: [HxWx3 BGR uint8] (H and W multiples of 8); masks: [HxW bool] -> [HxWx3 BGR uint8]"""
         with self.torch.no_grad():
+            if len(frames) == 1:  # flow needs two frames (e.g. a one-frame shot): duplicate it
+                return self._run(frames * 2, masks * 2, dilation)[:1]
             return self._run(frames, masks, dilation)
 
     def _run(self, frames, masks, dilation):
@@ -179,6 +182,7 @@ class ProPainterEngine:
 
 class ProPainterBackend:
     name = "propainter"
+    uses_cuts = True  # the pipeline passes shot cuts to erase()
     CTX = 10  # context frames added on each side of a chunk
     PAD = 8   # extra frames inpainted around each run of subtitle frames
 
@@ -188,25 +192,38 @@ class ProPainterBackend:
         self.chunk = chunk
         self.engine = ProPainterEngine(repo, raft_iter=raft_iter, subvideo_length=chunk + 2 * self.CTX)
 
-    def _chunks(self, frame_seg):
+    def _chunks(self, frame_seg, cuts=()):
         """Frames to inpaint -> runs (gaps <= 10 frames merged, PAD frames added at both ends)
-        -> chunks (s, e, cs, ce): output frames s..e, processed with context frames cs..ce"""
+        -> chunks (s, e, cs, ce): output frames s..e, processed with context frames cs..ce.
+
+        Nothing crosses a shot cut: ProPainter treats a chunk as one continuous shot and would copy
+        pixels from the other shot into the masked area (seen as dark, flickering blobs)."""
+        cuts = sorted(cuts)
+        end = 1 << 60  # open end of the last shot (the real frame count is only known while streaming)
+
+        def shot(i):
+            return bisect.bisect_right(cuts, i)
+
+        def bounds(sh):
+            return (cuts[sh - 1] if sh > 0 else 0), (cuts[sh] - 1 if sh < len(cuts) else end)
+
         runs = []
         for i in sorted(frame_seg):
-            if runs and i - runs[-1][1] <= 10:
+            if runs and i - runs[-1][1] <= 10 and shot(i) == runs[-1][2]:
                 runs[-1][1] = i
             else:
-                runs.append([i, i])
+                runs.append([i, i, shot(i)])
         chunks = []
-        for a, b in runs:
-            a = max(0, a - self.PAD)
-            b = b + self.PAD
+        for a, b, sh in runs:
+            lo, hi = bounds(sh)
+            a = max(lo, a - self.PAD)
+            b = min(hi, b + self.PAD)
             for s in range(a, b + 1, self.chunk):
                 e = min(b, s + self.chunk - 1)
-                chunks.append((s, e, max(0, s - self.CTX), e + self.CTX))
+                chunks.append((s, e, max(lo, s - self.CTX), min(hi, e + self.CTX)))
         return chunks
 
-    def erase(self, frames, frame_seg, masks):
+    def erase(self, frames, frame_seg, masks, cuts=()):
         if not frame_seg:
             yield from frames
             return
@@ -220,7 +237,7 @@ class ProPainterBackend:
         paste = {k: cv2.dilate(m[r0:r1].astype(np.uint8), kern).astype(bool) for k, m in masks.items()}
         empty = np.zeros((r1 - r0, W8), bool)
 
-        pending = deque(self._chunks(frame_seg))
+        pending = deque(self._chunks(frame_seg, cuts))
         n_chunks = len(pending)
         need = set()
         for _, _, cs, ce in pending:
@@ -237,6 +254,8 @@ class ProPainterBackend:
         def run(chunk, last):
             s, e, cs, ce = chunk
             ids = [i for i in range(cs, min(ce, last) + 1) if i in bands]
+            if not ids:
+                return
             ms = []
             for i in ids:
                 k = frame_seg.get(i)

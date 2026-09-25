@@ -8,7 +8,7 @@ import numpy as np
 from common import log
 from masks import box_masks, frame_masks, glyph_masks, white_pixels
 from subtitles import frame_boxes, segments_from_ocr, write_srt
-from video import open_writer, probe, read_frames
+from video import detect_cuts, open_writer, probe, read_frames
 
 
 def parse_band(s, H):
@@ -82,13 +82,19 @@ def process(src, out_dir, args, ocr, backend, encoder):
     frame_seg, masks = frame_masks(segs, masks, args.pad_frames)
     log(f"  {args.mask} masks done ({time.time() - t0:.0f}s)")
 
+    cuts = []
+    if getattr(backend, "uses_cuts", False):
+        t0 = time.time()
+        cuts = detect_cuts(src)
+        log(f"  {len(cuts)} shot cuts ({time.time() - t0:.0f}s)")
+
     # Pass 2: erase + encode
     t0 = time.time()
     dst = out_dir / (src.stem + "_clean.mp4")
     wr = open_writer(src, dst, W, H, fps, encoder, args.crf)
     written = 0
     try:
-        for frame in backend.erase(read_frames(src, W, H), frame_seg, masks):
+        for frame in backend.erase(read_frames(src, W, H), frame_seg, masks, cuts):
             wr.stdin.write(np.ascontiguousarray(frame).tobytes())
             written += 1
             if written % 100 == 0:

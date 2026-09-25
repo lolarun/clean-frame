@@ -61,6 +61,40 @@ def read_frames(path, w, h, crop=None):
         p.wait()
 
 
+def detect_cuts(path, threshold=12.0, ratio=3.0, window=5):
+    """Shot cut detection: frame indices that start a new shot.
+
+    Consecutive frames are compared as 320x180 grayscale (mean absolute difference, 0-255 scale).
+    A cut is a spike: the difference exceeds `threshold` AND is `ratio` times the local level
+    (median of the `window` differences on each side). Normal motion stays below ~5 and hard cuts
+    are usually 15-30+; the spike rule rejects sustained fast motion, fire or flashes, which would
+    otherwise split chunks needlessly."""
+    w, h = 320, 180
+    cmd = [_exe("ffmpeg"), "-v", "error", "-i", str(path), "-map", "0:v:0", "-vf", f"scale={w}:{h}",
+           "-f", "rawvideo", "-pix_fmt", "gray", "-"]
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, bufsize=w * h * 16)
+    diffs, prev = [], None
+    try:
+        while True:
+            buf = p.stdout.read(w * h)
+            if len(buf) < w * h:
+                break
+            cur = np.frombuffer(buf, np.uint8).astype(np.int16)
+            if prev is not None:
+                diffs.append(float(np.abs(cur - prev).mean()))  # diffs[j]: frame j -> j + 1
+            prev = cur
+    finally:
+        p.stdout.close()
+        p.wait()
+    d = np.array(diffs)
+    cuts = []
+    for j in np.nonzero(d > threshold)[0]:
+        around = np.r_[d[max(0, j - window):j], d[j + 1:j + 1 + window]]
+        if len(around) == 0 or d[j] > ratio * max(float(np.median(around)), 2.0):
+            cuts.append(int(j) + 1)
+    return cuts
+
+
 def pick_encoder(want):
     if want != "auto":
         return want
